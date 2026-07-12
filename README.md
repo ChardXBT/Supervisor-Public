@@ -1,144 +1,157 @@
 # Self-Recovering Automation
 
-Self-Recovering Automation is a public reference implementation of a control
-plane for long-running and scheduled software. It demonstrates how one manager
-can decide what should run, prevent duplicate starts, isolate failures, pause
-work during unsafe conditions, and recover without guessing that an interrupted
-job succeeded.
+This repo shows a manager I built to keep several automation projects running
+safely from one place.
 
-The repository is intentionally integration-free. It models the orchestration
-and recovery behavior with synthetic workflows so the design can be studied and
-run without accounts, credentials, background services, or external actions.
+It decides what can start, prevents duplicate programs, watches the computer
+and network, separates one bot failure from the rest of the system, and waits
+for real completion proof before calling a run successful. If the manager is
+interrupted, it checks saved state before normal work continues.
 
-## Monitor-only view
+The public version uses fake jobs. It does not start real programs or contain
+private paths, accounts, credentials, or bot settings.
 
-The image below is a real capture of the included Windows terminal monitor. It
-was opened in monitor-only mode, contained only synthetic idle workflows, and
-was captured at the window boundary so no user path or account information is
-visible.
+## What it does
+
+- Starts important live jobs before lower-priority daily work.
+- Starts only the amount of work the computer can handle.
+- Prevents two copies of the same job from running.
+- Pauses new decisions without touching jobs that are already running.
+- Supports sleep mode, which safely stops work and blocks restarts for a set
+  time.
+- Gives temporary failures a cooldown.
+- Keeps repair-required failures stopped until there is evidence of a fix.
+- Requires a fresh completion result instead of trusting a closed window or
+  old log line.
+- Recovers carefully after an unexpected manager shutdown.
+
+## Manager flow
+
+```mermaid
+flowchart TD
+    A["Manager starts"] --> B["Load configuration and saved state"]
+    B --> C{"Previous session closed cleanly?"}
+    C -->|No| D["Enter recovery mode"]
+    D --> E["Validate backups and inspect jobs one at a time"]
+    E --> F{"State consistent?"}
+    F -->|No| G["Hold unsafe work and show the reason"]
+    F -->|Yes| H["Continue normal monitoring"]
+    C -->|Yes| H
+    H --> I["Read process, network, battery, and computer load"]
+    I --> J{"Paused, sleeping, or unsafe?"}
+    J -->|Yes| K["Do not start new work"]
+    J -->|No| L["Build the eligible priority queue"]
+    L --> M{"Capacity available?"}
+    M -->|No| N["Wait and check again"]
+    M -->|Yes| O["Start the next eligible job"]
+    O --> P["Watch its process and completion evidence"]
+    P --> Q{"Verified result?"}
+    Q -->|Success| R["Mark complete and admit the next job"]
+    Q -->|Temporary failure| S["Start cooldown"]
+    Q -->|Repair required| T["Hold for attention"]
+    K --> I
+    N --> I
+    R --> I
+    S --> I
+    T --> I
+```
+
+The main rule is simple: starting a program is not the same as completing its
+work. The manager checks the result separately.
+
+## Monitor-only screen
+
+This is the included terminal monitor running with fake idle jobs. Monitor-only
+mode can display status but cannot launch or change a job.
 
 ![Monitor-only terminal](assets/monitor-only.png)
 
-Run the same screen locally:
+Open the same screen locally:
 
 ```bash
 python monitor.py
 ```
 
-Render one frame without opening a persistent monitor:
+Render one frame without keeping the monitor open:
 
 ```bash
 python monitor.py --once
 ```
 
-## The problem it solves
+## How failures are handled
 
-A script can be reliable in isolation and still fail as part of a larger
-system. Common failure modes include:
-
-- several due jobs starting together after a reboot;
-- a process exiting without producing valid completion evidence;
-- a temporary network outage being mistaken for a permanent failure;
-- a stale process identifier being mistaken for a live process;
-- a failed job preventing unrelated jobs from running;
-- an automatic restart fighting a user who intentionally stopped the system;
-- recovery beginning before saved state is known to be consistent.
-
-The manager addresses these as state transitions rather than scattered retry
-loops. Observation, policy, and action remain separate, making every decision
-explainable and testable.
-
-## System model
-
-```text
-health observations ──> safety policy ──> capacity-aware priority queue
-        │                      │                       │
-        │                      v                       v
-        └────────────> recovery state machine ──> job lifecycle
-                               │                       │
-                               └──── structured decisions ────┘
-```
-
-### 1. Observation layer
-
-The public demo treats health inputs as facts, not commands. A production
-adapter could report process liveness, connectivity, machine load, completion
-artifacts, or operator state. The policy layer decides what those facts permit.
-
-### 2. Safety policy
-
-Global conditions can block all new work, while job-specific failures affect
-only one workflow. The distinction prevents one broken integration from
-shutting down an otherwise healthy automation platform.
-
-### 3. Weighted priority queue
-
-Each workflow has a priority and resource weight. The scheduler selects only
-jobs that fit remaining capacity, preventing the classic recovery storm where
-every overdue task starts at once.
-
-### 4. Explicit lifecycle states
-
-```text
-READY ──> RUNNING ──> COMPLETE
-  ▲           │
-  │           ├──> PAUSED ───────────────┐
-  │           ├──> COOLDOWN ─────────────┤
-  │           └──> ATTENTION             │
-  └──────────────────────────────────────┘
-```
-
-- `PAUSED` preserves work across a global safety event.
-- `COOLDOWN` represents a retryable failure with delayed eligibility.
-- `ATTENTION` represents a durable condition that must not self-clear.
-- `COMPLETE` requires explicit proof; process exit alone is insufficient.
-
-## Reliability invariants
-
-| Invariant | Why it matters |
+| Situation | Manager response |
 | --- | --- |
-| One identity, one active instance | Prevents duplicate work after races or restarts |
-| Completion requires proof | An empty or interrupted run cannot look successful |
-| Failure scope is explicit | One workflow failure does not stop unrelated work |
-| Recovery is gated | Work resumes only after the recovery condition is verified |
-| Priority is capacity-aware | Important work wins without overloading the host |
-| Durable failures remain visible | The manager never loops forever on a known-broken job |
-| Monitor-only cannot act | Diagnostics cannot accidentally launch or modify workflows |
+| One job crashes | Isolate that job and leave unrelated work alone |
+| Several jobs become due together | Use priority and available capacity instead of starting all of them |
+| Network connection drops | Block new work and wait for a stable recovery period |
+| A process exits without a valid result | Mark the run incomplete and follow its retry rule |
+| A job reports a temporary problem | Start a cooldown and make it eligible later |
+| A job reports a repair-required problem | Keep it stopped until newer evidence shows a real fix |
+| An old process ID or log remains | Check current process identity and fresh timestamps before deciding |
+| The manager closes unexpectedly | Keep an unclean marker and validate state on the next start |
+| Monitor-only mode is active | Observe only; never launch, stop, or write control markers |
 
-## Deterministic failure demonstration
+## Job states
 
-`demo.py` runs the state machine through a reproducible sequence:
+```mermaid
+flowchart LR
+    A["Ready"] --> B["Running"]
+    B --> C["Complete"]
+    B --> D["Cooldown"]
+    B --> E["Attention"]
+    B --> F["Paused"]
+    D --> A
+    F --> A
+    E --> G["New fix evidence"]
+    G --> A
+```
 
-1. schedule work by priority and capacity;
-2. simulate a connectivity loss;
-3. checkpoint active workflows;
-4. verify recovery;
+- `Ready` means the job is eligible but has not started.
+- `Running` means the manager can identify the active job.
+- `Complete` requires a fresh result that proves useful work finished.
+- `Cooldown` is a temporary delay before another attempt.
+- `Attention` means the same run should not be repeated without a fix.
+- `Paused` keeps the current state while automatic decisions are off.
+
+## Priority and computer load
+
+Each job has a priority and an estimated resource weight. The manager checks
+available capacity before each start. This stops a restart or morning backlog
+from opening every browser and script at the same time.
+
+The queue is recalculated whenever a job starts, finishes, becomes blocked, or
+the computer's condition changes. A lower-priority job is not forgotten. It
+stays in the queue until it is complete, blocked for a clear reason, or no
+longer due.
+
+## Recovery demo
+
+`demo.py` walks through a fixed failure and recovery sequence:
+
+1. select work by priority and capacity;
+2. simulate a lost connection;
+3. preserve running job state;
+4. wait for recovery proof;
 5. resume eligible work;
-6. accept completion only after explicit proof.
+6. accept completion only after a fresh result.
 
 ```bash
 python demo.py --dry-run
 ```
 
-The demonstration never starts an operating-system process or contacts an
-external service.
+The demo does not start an operating-system process or contact an external
+service.
 
-## Testing strategy
-
-The test suite covers behavior, not just individual functions:
-
-- capacity limits prevent start storms;
-- disconnects pause work without marking it complete;
-- cooldowns require explicit release;
-- durable failures are not retried automatically;
-- monitor output remains fixed-width and identity-free;
-- monitor-only language clearly states that launches and writes are blocked.
+## Run the tests
 
 ```bash
 python -m unittest discover -s tests -v
 ```
 
-The same commands run in GitHub Actions on every push and pull request.
+The tests cover capacity limits, duplicate prevention, disconnect recovery,
+cooldowns, attention states, completion proof, and monitor-only safety. GitHub
+Actions runs the same checks on every push and pull request.
 
 ## Repository layout
 
@@ -149,21 +162,20 @@ The same commands run in GitHub Actions on every push and pull request.
 ├── scripts/capture_monitor.ps1
 ├── src/self_recovering_automation/
 │   ├── engine.py       # Priority, capacity, failure, and recovery decisions
-│   ├── model.py        # Typed workflow states and events
-│   ├── monitor.py      # Stable monitor-only screen model
-│   └── cli.py          # Deterministic recovery demonstration
+│   ├── model.py        # Job states and decision events
+│   ├── monitor.py      # Stable monitor-only screen
+│   └── cli.py          # Fixed recovery demo
 ├── tests/
 ├── demo.py
 ├── monitor.py
 └── pyproject.toml
 ```
 
-## Public boundary
+## Public version
 
-This repository demonstrates control-plane architecture, not production
-integrations. It contains no service adapters, credentials, user identifiers,
-machine-specific configuration, or private operational rules. The production
-system that inspired it adds persistent state, interactive terminal hosting,
-and integration contracts behind the same safety boundaries.
+This repo contains no real bot launchers, credentials, user IDs, computer
+paths, private rules, or marketplace connections. The full system adds real
+process hosting, interactive terminal screens, saved state, and per-project
+safety checks behind the same basic flow.
 
-See [the architecture notes](docs/architecture.md) for a compact design map.
+See [the architecture notes](docs/architecture.md) for the module map.

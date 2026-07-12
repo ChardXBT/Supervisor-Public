@@ -16,7 +16,7 @@ def render_demo() -> str:
     engine.schedule()
 
     lines = [
-        "SELF-RECOVERING AUTOMATION  |  deterministic dry-run",
+        "SELF-RECOVERING AUTOMATION  |  safe dry-run",
         "=" * 72,
         "SEQ  LEVEL  COMPONENT         ACTION       DECISION",
     ]
@@ -36,7 +36,7 @@ def render_demo() -> str:
 
 
 def main() -> None:
-    parser = argparse.ArgumentParser(description="Run the safe orchestration demonstration")
+    parser = argparse.ArgumentParser(description="Run the safe manager recovery demo")
     parser.add_argument("--dry-run", action="store_true", help="retained for explicitness; all runs are safe")
     parser.parse_args()
     print(render_demo())

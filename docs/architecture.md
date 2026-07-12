@@ -1,38 +1,46 @@
 # Architecture
 
-This public repository models the control plane of a resilient automation
-manager without containing any production adapters.
+This public repo models the main decisions made by an automation manager. It
+uses fake jobs and does not include production launchers.
 
-```text
-health signals -> safety gates -> priority queue -> job state machine
-      |                |               |                 |
-      +------ structured decision and recovery events ---+
+```mermaid
+flowchart TD
+    A["Health and job observations"] --> B["Safety checks"]
+    B --> C{"Starts allowed?"}
+    C -->|No| D["Record the blocker and wait"]
+    C -->|Yes| E["Priority and capacity queue"]
+    E --> F["Job state update"]
+    F --> G{"Fresh completion proof?"}
+    G -->|Yes| H["Complete"]
+    G -->|No, still running| I["Keep watching"]
+    G -->|Temporary failure| J["Cooldown"]
+    G -->|Repair required| K["Attention"]
+    D --> A
+    H --> A
+    I --> A
+    J --> A
+    K --> A
 ```
 
-## Design boundaries
+## Design rules
 
-- **Observation is separate from action.** Health checks produce facts; policy
-  decides whether an action is allowed.
-- **Starts are capacity-aware.** A weighted queue prevents a restart storm
-  after a machine or network recovery.
-- **Failure types are explicit.** Temporary failures enter cooldown; durable
-  failures require attention; neither is silently called a success.
-- **Completion needs proof.** A process exit alone is not modeled as completed.
-- **Recovery is conservative.** Work resumes only after the recovery signal is
-  explicitly verified.
-- **Diagnostics cannot act.** The monitor-only screen is rendered from static
-  synthetic state and has no process-control or write capability.
+- Health checks report facts. They do not start or stop work by themselves.
+- The queue checks computer capacity before each launch.
+- Temporary and repair-required failures use different states.
+- A process exit is not enough to prove completion.
+- Recovery waits for a verified safe condition.
+- Monitor-only output has no process or write access.
 
-## Public components
+## Files
 
-| Component | Role |
+| File | Purpose |
 | --- | --- |
-| `model.py` | Typed workflow states and structured decision events |
-| `engine.py` | Priority, capacity, pause, cooldown, and recovery transitions |
-| `monitor.py` | Stable identity-free monitor-only screen model |
-| `cli.py` | Deterministic failure and recovery walkthrough |
-| `capture_monitor.ps1` | Window-scoped screenshot capture with no keyboard automation |
+| `model.py` | Job states and structured decision events |
+| `engine.py` | Priority, capacity, pause, cooldown, and recovery rules |
+| `monitor.py` | Stable monitor-only screen using fake state |
+| `cli.py` | Fixed failure and recovery walkthrough |
+| `capture_monitor.ps1` | Window-only screenshot helper with no keyboard automation |
 
-The production system that inspired this demonstration adds operating-system
-process hosting, interactive terminal panes, persistent state, and integration
-adapters. Those details are intentionally excluded from this public version.
+The full private system adds real process hosting, interactive terminal panes,
+saved state, and project-specific adapters. Those details are not part of this
+public repo.

@@ -17,11 +17,11 @@ def _divider(title: str = "") -> str:
 
 
 def render_monitor() -> str:
-    """Render a stable, synthetic monitor-only screen for demonstrations."""
+    """Render a stable monitor-only screen using fake job state."""
     lines = [
         "┌" + "─" * (WIDTH - 2) + "┐",
         _row("SELF-RECOVERING AUTOMATION"),
-        _row("Monitor-only demonstration · no external processes or services"),
+        _row("Monitor-only demo | no external processes or services"),
         _divider("SYSTEM"),
         _row("Mode            MONITOR ONLY      Automation decisions        DISABLED"),
         _row("Connectivity    SIMULATED / READY  Resource safety gate       SAFE"),

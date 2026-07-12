@@ -5,7 +5,7 @@ build-backend = "setuptools.build_meta"
 [project]
 name = "self-recovering-automation"
 version = "1.0.0"
-description = "A safe, deterministic demonstration of resilient automation orchestration."
+description = "A public demo of a manager that schedules, monitors, and recovers automation jobs."
 requires-python = ">=3.11"
 
 [project.scripts]
