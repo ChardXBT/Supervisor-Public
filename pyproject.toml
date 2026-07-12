@@ -7,13 +7,9 @@ name = "self-recovering-automation"
 version = "1.0.0"
 description = "A safe, deterministic demonstration of resilient automation orchestration."
 requires-python = ">=3.11"
-license = { text = "MIT" }
 
 [project.scripts]
 automation-demo = "self_recovering_automation.cli:main"
-
-[project.optional-dependencies]
-assets = ["Pillow>=10"]
 
 [tool.setuptools.packages.find]
 where = ["src"]
