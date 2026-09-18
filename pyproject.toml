@@ -3,13 +3,13 @@ requires = ["setuptools>=70"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "self-recovering-automation"
+name = "supervisor-public"
 version = "1.0.0"
-description = "A public demo of a manager that schedules, monitors, and recovers automation jobs."
+description = "A sanitized architectural model of a self-recovering automation supervisor."
 requires-python = ">=3.11"
 
 [project.scripts]
-automation-demo = "self_recovering_automation.cli:main"
+supervisor-demo = "supervisor_public.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

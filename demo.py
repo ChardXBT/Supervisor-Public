@@ -1,14 +1,8 @@
-from __future__ import annotations
-
+"""Entry point for the Supervisor Public demonstration."""
 import sys
 from pathlib import Path
 
+sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
+from supervisor_public.cli import main  # noqa: E402
 
-ROOT = Path(__file__).resolve().parent
-sys.path.insert(0, str(ROOT / "src"))
-
-from self_recovering_automation.cli import main  # noqa: E402
-
-
-if __name__ == "__main__":
-    main()
+main()

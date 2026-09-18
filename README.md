@@ -1,181 +1,235 @@
-# Self-Recovering Automation
+# Supervisor Public
 
-This repo shows a manager I built to keep several automation projects running
-safely from one place.
+A sanitized architectural model of a self-recovering automation supervisor.
 
-It decides what can start, prevents duplicate programs, watches the computer
-and network, separates one bot failure from the rest of the system, and waits
-for real completion proof before calling a run successful. If the manager is
-interrupted, it checks saved state before normal work continues.
+This repository publicly represents the architecture, state flow, recovery philosophy, and engineering decisions behind a private production supervisor that coordinates multiple long-running automation projects. It is not the production system itself.
 
-The public version uses fake jobs. It does not start real programs or contain
-private paths, accounts, credentials, or bot settings.
+## What the Supervisor does
 
-## What it does
+The Supervisor is not one automation script. It is a manager that decides what should run, tracks project state, starts and stops projects, prevents duplicate ownership, detects failures, distinguishes recoverable errors from states requiring intervention, enforces cooldowns, verifies completion, and maintains consistent state after unexpected shutdowns.
 
-- Starts important live jobs before lower-priority daily work.
-- Starts only the amount of work the computer can handle.
-- Prevents two copies of the same job from running.
-- Pauses new decisions without touching jobs that are already running.
-- Supports sleep mode, which safely stops work and blocks restarts for a set
-  time.
-- Gives temporary failures a cooldown.
-- Keeps repair-required failures stopped until there is evidence of a fix.
-- Requires a fresh completion result instead of trusting a closed window or
-  old log line.
-- Recovers carefully after an unexpected manager shutdown.
+The production implementation handles real process ownership, interactive terminal sessions, marketplace compatibility, authentication lifecycle detection, network-aware scheduling, and repository publication barriers. This public model communicates the same architectural concepts through a lightweight, deterministic state machine.
 
-## Manager flow
+## Architecture
 
-```mermaid
-flowchart TD
-    A["Manager starts"] --> B["Load configuration and saved state"]
-    B --> C{"Previous session closed cleanly?"}
-    C -->|No| D["Enter recovery mode"]
-    D --> E["Validate backups and inspect jobs one at a time"]
-    E --> F{"State consistent?"}
-    F -->|No| G["Hold unsafe work and show the reason"]
-    F -->|Yes| H["Continue normal monitoring"]
-    C -->|Yes| H
-    H --> I["Read process, network, battery, and computer load"]
-    I --> J{"Paused, sleeping, or unsafe?"}
-    J -->|Yes| K["Do not start new work"]
-    J -->|No| L["Build the eligible priority queue"]
-    L --> M{"Capacity available?"}
-    M -->|No| N["Wait and check again"]
-    M -->|Yes| O["Start the next eligible job"]
-    O --> P["Watch its process and completion evidence"]
-    P --> Q{"Verified result?"}
-    Q -->|Success| R["Mark complete and admit the next job"]
-    Q -->|Temporary failure| S["Start cooldown"]
-    Q -->|Repair required| T["Hold for attention"]
-    K --> I
-    N --> I
-    R --> I
-    S --> I
-    T --> I
+```
+                  +---------------------+
+                  |    Supervisor UI    |
+                  |  CLI / Monitor      |
+                  +----------+----------+
+                             |
+                             v
+                  +---------------------+
+                  |  Supervisor Engine  |
+                  |  State + Decisions  |
+                  +----------+----------+
+                             |
+               +-------------+-------------+
+               v             v             v
+          Scheduler     Safety Gates   Project Registry
+               |             |             |
+               +-------------+-------------+
+                             |
+                             v
+                  +---------------------+
+                  | Project Lifecycle   |
+                  | Start / Stop / Run  |
+                  | Recovery / Retry    |
+                  +----------+----------+
+                             |
+                             v
+                  +---------------------+
+                  | Managed Projects    |
+                  | Workers / Syncs     |
+                  +----------+----------+
+                             |
+                             v
+                  +---------------------+
+                  | Observation + State |
+                  | Health / Events /   |
+                  | Completion Proof    |
+                  +----------+----------+
+                             |
+                             v
+                  +---------------------+
+                  | Recovery / Reconcile|
+                  +---------------------+
 ```
 
-The main rule is simple: starting a program is not the same as completing its
-work. The manager checks the result separately.
+Every cycle, the engine:
 
-## Monitor-only screen
+1. Validates configuration, cooldowns, and safety gates
+2. Inspects process ownership (PID + creation-time identity in production)
+3. Evaluates network, resource, and pause state
+4. Selects the highest-priority eligible project that fits capacity
+5. Observes results through completion evidence, not just process exit
+6. Persists state atomically for crash recovery
 
-This is the included terminal monitor running with fake idle jobs. Monitor-only
-mode can display status but cannot launch or change a job.
+## Lifecycle
 
-![Monitor-only terminal](assets/monitor-only.png)
+Projects move through explicit states with validated transitions:
 
-Open the same screen locally:
+```
+READY
+  |
+  v
+STARTING -----> COOLDOWN (temporary failure)
+  |                |
+  v                v
+RUNNING         READY (after cooldown)
+  |
+  +--> STOPPING --> STOPPED
+  |
+  +--> COOLDOWN --> READY
+  |
+  +--> REPAIR_REQUIRED (durable failure; requires operator action)
+  |
+  +--> PAUSED (network loss or operator hold)
+```
+
+Key design principle: **a failed state never auto-resolves downward in severity.** Repair-required projects remain visible until real fix evidence or an explicit operator acknowledgment returns them to the eligible queue.
+
+## Recovery philosophy
+
+The important design principle is not simply "if something crashes, restart it."
+
+The Supervisor first determines what state the system is actually in, verifies ownership and process identity where necessary, and only then decides whether recovery is safe. After an unexpected shutdown:
+
+1. Load persisted state
+2. Determine whether the previous session ended cleanly
+3. Inspect persisted process ownership records
+4. Reconcile against current OS processes
+5. Detect stale or ambiguous ownership
+6. Recover safe projects
+7. Hold unsafe or ambiguous projects
+8. Only then enter normal scheduling
+
+This prevents the system from blindly relaunching a process that may still be running, or losing in-flight work from an interrupted shutdown.
+
+## Process ownership
+
+The Supervisor must know which process belongs to which managed project. A PID alone is not enough.
+
+The production implementation verifies process identity through PID plus Windows creation timestamp (birth marker). A live process with a different birth time proves the original exited and the operating system reused its PID. The Supervisor never trusts a PID file or Task Scheduler state without independent verification.
+
+This prevents duplicate launches, misattributed exits, and stale state from corrupting the system.
+
+## Completion verification
+
+Process exit is not proof that work succeeded.
+
+The Supervisor distinguishes two observations:
+
+- **Process exited**: the child process is no longer running
+- **Work completed**: a fresh, identity-bound, timestamp-correlated artifact confirms the operation succeeded
+
+A stale completion marker, partial output, or exit code zero from an unknown run is never accepted as proof. Every completion requires verified evidence from the specific run that was launched.
+
+## Stop transactions
+
+Stopping a project is not a single operation. It is a transaction with phases:
+
+```
+REQUESTED -> SIGNAL -> WAIT -> VERIFY_EXIT -> FINALIZE_STATE
+```
+
+Each phase is recorded. If the child does not exit within the timeout, the Supervisor holds the failure rather than silently claiming success. The scheduler cannot relaunch a project while its stop transaction is unresolved.
+
+## Retry vs repair-required
+
+The Supervisor separates temporary failures from failures requiring intervention.
+
+**Temporary failure** (retry with cooldown):
+```
+RUNNING -> COOLDOWN -> READY
+```
+
+**Repair-required failure** (latched until explicit action):
+```
+RUNNING -> REPAIR_REQUIRED
+```
+
+A repair-required project does not automatically restart because the next scheduler cycle occurs. It requires fresh verified evidence or an explicit operator acknowledgment before returning to the eligible queue. This prevents retry storms on durable problems.
+
+## Authentication state
+
+The production Supervisor detects authentication state through read-only verification (not login attempts). The detection flow:
+
+```
+DETECT -> DECISION -> AUTH REQUEST -> RESULT -> RECONCILIATION
+```
+
+Only a confirmed logged-out state triggers automatic re-authentication. Transient, human, or unknown states are never auto-triggered. The child process owns the attempt budget and cooldown logic.
+
+This public model represents the concept without any real authentication implementation.
+
+## Remote control
+
+The production Supervisor exposes a loopback HTTP gateway for remote commands (start, stop, force-rerun, status). Commands are serialized through a control request queue with correlation IDs for audit trails. The gateway is bound to localhost and authenticated through the operating system's identity.
+
+This public model demonstrates the CLI interface. The remote control architecture is documented but not implemented.
+
+## Observability
+
+Every decision produces structured information: timestamp, severity, component, project, operation, event, decision, reason, state transition, and attempt number.
+
+The production system writes a machine-readable decision summary each cycle, maintains atomic state snapshots, and preserves per-run archives with timestamps and exit codes. Logs use semantic event names (not arbitrary strings) so they are useful for both human debugging and automated diagnosis.
+
+## Failure isolation
+
+One project failing should not corrupt the state of unrelated projects. Each project maintains independent state, cooldown timers, attempt counters, and repair-latch conditions. A failure in one project does not prevent other eligible projects from being scheduled.
+
+## Running the demo
 
 ```bash
+# Run the demonstration scenario
+python demo.py
+
+# Or with the installed entry point
+supervisor-demo
+
+# View the monitor display (single frame)
+python monitor.py --once
+
+# View the monitor display (refreshing loop)
 python monitor.py
 ```
 
-Render one frame without keeping the monitor open:
+The demo exercises scheduling, network recovery, failure handling, repair-required state, graceful stop, and unclean-shutdown recovery. No processes are spawned and no external state is modified.
 
-```bash
-python monitor.py --once
-```
-
-## How failures are handled
-
-| Situation | Manager response |
-| --- | --- |
-| One job crashes | Isolate that job and leave unrelated work alone |
-| Several jobs become due together | Use priority and available capacity instead of starting all of them |
-| Network connection drops | Block new work and wait for a stable recovery period |
-| A process exits without a valid result | Mark the run incomplete and follow its retry rule |
-| A job reports a temporary problem | Start a cooldown and make it eligible later |
-| A job reports a repair-required problem | Keep it stopped until newer evidence shows a real fix |
-| An old process ID or log remains | Check current process identity and fresh timestamps before deciding |
-| The manager closes unexpectedly | Keep an unclean marker and validate state on the next start |
-| Monitor-only mode is active | Observe only; never launch, stop, or write control markers |
-
-## Job states
-
-```mermaid
-flowchart LR
-    A["Ready"] --> B["Running"]
-    B --> C["Complete"]
-    B --> D["Cooldown"]
-    B --> E["Attention"]
-    B --> F["Paused"]
-    D --> A
-    F --> A
-    E --> G["New fix evidence"]
-    G --> A
-```
-
-- `Ready` means the job is eligible but has not started.
-- `Running` means the manager can identify the active job.
-- `Complete` requires a fresh result that proves useful work finished.
-- `Cooldown` is a temporary delay before another attempt.
-- `Attention` means the same run should not be repeated without a fix.
-- `Paused` keeps the current state while automatic decisions are off.
-
-## Priority and computer load
-
-Each job has a priority and an estimated resource weight. The manager checks
-available capacity before each start. This stops a restart or morning backlog
-from opening every browser and script at the same time.
-
-The queue is recalculated whenever a job starts, finishes, becomes blocked, or
-the computer's condition changes. A lower-priority job is not forgotten. It
-stays in the queue until it is complete, blocked for a clear reason, or no
-longer due.
-
-## Recovery demo
-
-`demo.py` walks through a fixed failure and recovery sequence:
-
-1. select work by priority and capacity;
-2. simulate a lost connection;
-3. preserve running job state;
-4. wait for recovery proof;
-5. resume eligible work;
-6. accept completion only after a fresh result.
-
-```bash
-python demo.py --dry-run
-```
-
-The demo does not start an operating-system process or contact an external
-service.
-
-## Run the tests
+## Running the tests
 
 ```bash
 python -m unittest discover -s tests -v
 ```
 
-The tests cover capacity limits, duplicate prevention, disconnect recovery,
-cooldowns, attention states, completion proof, and monitor-only safety. GitHub
-Actions runs the same checks on every push and pull request.
+## Project layout
 
-## Repository layout
+```
+src/supervisor_public/
+  __init__.py       Package exports
+  model.py          Project states, events, transition rules
+  engine.py         Supervisor engine (state machine + decisions)
+  cli.py            Demo scenario runner
+  monitor.py        Terminal monitor display
 
-```text
-.
-├── assets/monitor-only.png
-├── docs/architecture.md
-├── scripts/capture_monitor.ps1
-├── src/self_recovering_automation/
-│   ├── engine.py       # Priority, capacity, failure, and recovery decisions
-│   ├── model.py        # Job states and decision events
-│   ├── monitor.py      # Stable monitor-only screen
-│   └── cli.py          # Fixed recovery demo
-├── tests/
-├── demo.py
-├── monitor.py
-└── pyproject.toml
+tests/
+  test_engine.py    Engine state transitions and recovery
+  test_monitor.py   Monitor safety invariants
+  test_public_copy.py  Documentation quality checks
+
+docs/
+  architecture.md   Detailed architecture documentation
 ```
 
-## Public version
+## Public vs private
 
-This repo contains no real bot launchers, credentials, user IDs, computer
-paths, private rules, or marketplace connections. The full system adds real
-process hosting, interactive terminal screens, saved state, and per-project
-safety checks behind the same basic flow.
+This repository is a sanitized public architectural model. It communicates the same major concepts, state flows, and engineering decisions as the production Supervisor while containing no private infrastructure, project names, credentials, URLs, business logic, or other sensitive information.
 
-See [the architecture notes](docs/architecture.md) for the module map.
+The production implementation adds: real process hosting with PID-reuse-safe identity, interactive terminal sessions, multi-phase stop transactions with SHA-256 evidence digests, unclean-session recovery with orphan detection, marketplace compatibility enforcement, network-aware scheduling with escalating backoff, authentication lifecycle detection, repository publication barriers, and a Textual-based terminal UI.
+
+The engineering in this repository is real. The example projects are generic.
+
+## License
+
+MIT
