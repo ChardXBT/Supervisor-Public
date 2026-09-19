@@ -60,16 +60,32 @@ The Supervisor uses a two-process architecture. The manager process runs an oute
 
 Projects move through explicit states with validated transitions:
 
-```
-                    +--> STOPPING --> STOPPED
-                    |
-READY --> STARTING -+--> COOLDOWN --> READY
-                    |
-                    +--> REPAIR_REQUIRED
-                    |
-                    +--> PAUSED
-                    |
-                    +--> RESTART_HOLD --> READY
+```mermaid
+stateDiagram-v2
+    [*] --> READY
+    READY --> STARTING : schedule
+    STARTING --> RUNNING : process confirmed
+    STARTING --> COOLDOWN : temporary failure
+    STARTING --> REPAIR_REQUIRED : durable failure
+    STARTING --> STOPPED : launch failed
+    STARTING --> STOPPING : stop requested
+    RUNNING --> STOPPING : stop requested
+    RUNNING --> COOLDOWN : temporary failure
+    RUNNING --> REPAIR_REQUIRED : durable failure
+    RUNNING --> PAUSED : network loss or operator hold
+    RUNNING --> STOPPED : process exited
+    RUNNING --> RECOVERING : unclean shutdown
+    STOPPING --> STOPPED : exit verified
+    STOPPING --> RECOVERING : interrupted shutdown
+    STOPPED --> RECOVERING : unclean session detected
+    STOPPED --> READY : relaunch eligible
+    COOLDOWN --> READY : cooldown expired
+    COOLDOWN --> REPAIR_REQUIRED : budget exhausted
+    REPAIR_REQUIRED --> READY : operator acknowledgment
+    RECOVERING --> READY : process absent, cleared
+    RECOVERING --> RUNNING : process re-adopted
+    PAUSED --> READY : network restored
+    PAUSED --> STOPPED : operator stop
 ```
 
 | State | Meaning |
@@ -110,9 +126,19 @@ A stale completion marker, partial output, or exit code zero from an unknown run
 
 Stopping a project is not a single operation. It is a multi-phase transaction with cryptographic evidence:
 
-```
-prepared -> request_published -> child_acknowledged -> persistence_in_progress
--> child_receipt_verified -> process_exit_verified -> cleanup_pending -> complete
+```mermaid
+flowchart LR
+    A["prepared"] --> B["request_published"]
+    B --> C["child_acknowledged"]
+    C --> D["persistence_in_progress"]
+    D --> E["child_receipt_verified"]
+    E --> F["process_exit_verified"]
+    F --> G["cleanup_pending"]
+    G --> H["complete"]
+    E --> I["attention_required"]
+    F --> I
+    G --> I
+    H --> J["orphaned"]
 ```
 
 | Phase | What happens |
@@ -133,13 +159,21 @@ If the child does not exit within the timeout, the Supervisor escalates from coo
 The Supervisor separates temporary failures from failures requiring intervention.
 
 **Temporary failure** (retry with cooldown):
-```
-RUNNING -> COOLDOWN -> READY
+
+```mermaid
+stateDiagram-v2
+    [*] --> RUNNING
+    RUNNING --> COOLDOWN : temporary failure
+    COOLDOWN --> READY : cooldown expired
 ```
 
 **Repair-required failure** (latched until explicit action):
-```
-RUNNING -> REPAIR_REQUIRED
+
+```mermaid
+stateDiagram-v2
+    [*] --> RUNNING
+    RUNNING --> REPAIR_REQUIRED : durable failure
+    REPAIR_REQUIRED --> READY : operator acknowledgment
 ```
 
 A repair-required project does not automatically restart because the next scheduler cycle occurs. It requires fresh verified evidence or an explicit operator acknowledgment before returning to the eligible queue. This prevents retry storms on durable problems.
@@ -211,8 +245,20 @@ The host captures output (last 65,536 characters persisted on exit), tracks PID 
 
 The Supervisor detects authentication state through read-only verification, not login attempts:
 
-```
-read-only auth verify -> LOGGED_OUT? -> auth automatic (child-owned budget)
+```mermaid
+flowchart TD
+    A["Read-only auth verify"] --> B{"State?"}
+    B -->|"LOGGED_OUT"| C["Trigger auth automatic"]
+    B -->|"LOGGED_IN"| D["No action"]
+    B -->|"TRANSIENT"| E["No action"]
+    B -->|"UNKNOWN"| E
+    C --> F["Child-owned budget: 3 attempts per 6 hours"]
+    F --> G{"Budget remaining?"}
+    G -->|"Yes"| H["Execute re-authentication"]
+    G -->|"No"| I["Escalating cooldown"]
+    H --> J{"Success?"}
+    J -->|"Yes"| D
+    J -->|"No"| I
 ```
 
 Only a confirmed logged-out state triggers automatic re-authentication. The child process owns a 3-attempts-per-6-hours budget with escalating cooldowns. Transient, human, or unknown states are never auto-triggered.
