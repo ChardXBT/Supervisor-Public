@@ -12,7 +12,15 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
-from .model import Event, LEGAL_TRANSITIONS, Project, ProjectState
+from .model import (
+    Event,
+    LEGAL_RUN_MODE_TRANSITIONS,
+    LEGAL_TRANSITIONS,
+    PauseCause,
+    Project,
+    ProjectState,
+    RunMode,
+)
 
 
 @dataclass
@@ -29,8 +37,7 @@ class SupervisorEngine:
 
     projects: list[Project]
     capacity: int = 3
-    network_ready: bool = True
-    automation_paused: bool = False
+    run_mode: RunMode = RunMode.NORMAL
     events: list[Event] = field(default_factory=list)
     _sequence: int = 0
 
@@ -59,8 +66,14 @@ class SupervisorEngine:
                 f"illegal transition {project.state.value} -> {new_state.value} "
                 f"for {project.name}; allowed: {sorted(s.value for s in allowed)}"
             )
+        if new_state is ProjectState.PAUSED and not project.paused_by:
+            raise ValueError(
+                f"cannot pause {project.name} without a recorded pause cause"
+            )
         old_state = project.state
         project.state = new_state
+        if new_state is not ProjectState.PAUSED:
+            project.paused_by.clear()
         project.last_reason = reason
         self._record(
             "INFO" if new_state in (ProjectState.RUNNING, ProjectState.READY, ProjectState.STOPPED) else "WARN",
@@ -70,6 +83,38 @@ class SupervisorEngine:
             state=new_state.value,
             attempt=project.attempts,
         )
+
+    def _transition_run_mode(self, new_mode: RunMode, reason: str) -> None:
+        """Validate and perform a run-mode transition, recording the event.
+
+        Every run-mode change flows through here so a hold can only be
+        raised or cleared one axis at a time.
+        """
+        allowed = LEGAL_RUN_MODE_TRANSITIONS.get(self.run_mode, set())
+        if new_mode not in allowed:
+            raise ValueError(
+                f"illegal run-mode transition {self.run_mode!r} -> {new_mode!r}; "
+                f"allowed: {sorted(m.value for m in allowed)}"
+            )
+        old_mode = self.run_mode
+        self.run_mode = new_mode
+        self._record(
+            "WARN" if new_mode in (RunMode.NETWORK_HOLD, RunMode.DUAL_HOLD) else "INFO",
+            "supervisor",
+            f"run_mode:{old_mode.value}->{new_mode.value}",
+            reason,
+            state=new_mode.value,
+        )
+
+    @property
+    def network_ready(self) -> bool:
+        """Derived from run_mode: False while a network hold is active."""
+        return self.run_mode in (RunMode.NORMAL, RunMode.OPERATOR_HOLD)
+
+    @property
+    def automation_paused(self) -> bool:
+        """Derived from run_mode: True while an operator hold is active."""
+        return self.run_mode in (RunMode.OPERATOR_HOLD, RunMode.DUAL_HOLD)
 
     @property
     def running_weight(self) -> int:
@@ -92,12 +137,20 @@ class SupervisorEngine:
         duplicate-start prevention, and schedule-window eligibility.
         This public version models the key decision categories.
         """
-        if self.automation_paused:
-            self._record("INFO", "supervisor", "hold", "automation is paused by operator")
-            return None
-        if not self.network_ready:
+        if self.run_mode is RunMode.NETWORK_HOLD:
             self._record("WARN", "supervisor", "hold", "network recovery not yet verified")
             return None
+        if self.run_mode is RunMode.OPERATOR_HOLD:
+            self._record("INFO", "supervisor", "hold", "automation is paused by operator")
+            return None
+        if self.run_mode is RunMode.DUAL_HOLD:
+            self._record(
+                "WARN", "supervisor", "hold",
+                "automation paused and network recovery not yet verified",
+            )
+            return None
+        if self.run_mode is not RunMode.NORMAL:
+            raise ValueError(f"unknown run mode: {self.run_mode!r}")
 
         candidates = sorted(
             (p for p in self.projects if p.state is ProjectState.READY),
@@ -218,23 +271,63 @@ class SupervisorEngine:
         cooperatively pausing affected bots.  This public version models
         the pause-all on connectivity loss.
         """
-        self.network_ready = False
-        self._record("WARN", "supervisor", "pause", "connectivity check failed; pausing affected projects")
+        target = RunMode.DUAL_HOLD if self.automation_paused else RunMode.NETWORK_HOLD
+        self._transition_run_mode(
+            target, "connectivity check failed; pausing affected projects"
+        )
         for project in self.projects:
             if project.state is ProjectState.RUNNING:
+                project.paused_by.add(PauseCause.NETWORK)
                 self._transition(project, ProjectState.PAUSED, "paused at safe boundary due to network loss")
+            elif project.state is ProjectState.PAUSED:
+                project.paused_by.add(PauseCause.NETWORK)
+                self._record("WARN", project.name, "hold", "network hold stacked on existing pause")
 
     def recover_network(self) -> None:
         """Network connectivity restored; resume paused projects.
 
         The real Supervisor waits for a stable connectivity window before
         resuming, and verifies network state through DNS/HTTP probes.
+        Only the network hold is cleared: a project paused for another
+        recorded cause (e.g. an operator hold) stays parked.
         """
-        self.network_ready = True
-        self._record("INFO", "supervisor", "recover", "stable connectivity window verified")
+        target = RunMode.OPERATOR_HOLD if self.automation_paused else RunMode.NORMAL
+        self._transition_run_mode(target, "stable connectivity window verified")
         for project in self.projects:
             if project.state is ProjectState.PAUSED:
-                self._transition(project, ProjectState.READY, "network recovered; eligible to resume")
+                project.paused_by.discard(PauseCause.NETWORK)
+                if not project.paused_by:
+                    self._transition(project, ProjectState.READY, "network recovered; eligible to resume")
+
+    # -- operator hold ------------------------------------------------------
+
+    def pause_automation(self) -> None:
+        """Operator hold: park running work and block new starts.
+
+        The real Supervisor exposes pause/resume through its remote
+        gateway.  This public version records the hold as one axis of the
+        run mode and stacks it per project, so a concurrent network hold
+        cannot silently clear it.
+        """
+        target = RunMode.DUAL_HOLD if not self.network_ready else RunMode.OPERATOR_HOLD
+        self._transition_run_mode(target, "automation paused by operator")
+        for project in self.projects:
+            if project.state is ProjectState.RUNNING:
+                project.paused_by.add(PauseCause.OPERATOR)
+                self._transition(project, ProjectState.PAUSED, "paused at safe boundary by operator hold")
+            elif project.state is ProjectState.PAUSED:
+                project.paused_by.add(PauseCause.OPERATOR)
+                self._record("INFO", project.name, "hold", "operator hold stacked on existing pause")
+
+    def resume_automation(self) -> None:
+        """Release the operator hold; projects it parked become eligible."""
+        target = RunMode.NETWORK_HOLD if not self.network_ready else RunMode.NORMAL
+        self._transition_run_mode(target, "operator resumed automation")
+        for project in self.projects:
+            if project.state is ProjectState.PAUSED:
+                project.paused_by.discard(PauseCause.OPERATOR)
+                if not project.paused_by:
+                    self._transition(project, ProjectState.READY, "operator hold released; eligible to resume")
 
     # -- recovery ------------------------------------------------------------
 

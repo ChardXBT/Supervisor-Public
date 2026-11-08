@@ -32,6 +32,32 @@ class ProjectState(str, Enum):
     RECOVERING = "recovering"
 
 
+class PauseCause(str, Enum):
+    """A recorded reason a project is held in PAUSED.
+
+    A project stays paused until every cause in ``paused_by`` has cleared,
+    so an operator hold and a network hold stack without overwriting each
+    other.
+    """
+
+    NETWORK = "network"
+    OPERATOR = "operator"
+
+
+class RunMode(str, Enum):
+    """Supervisor run mode: network readiness x operator hold as one state.
+
+    These were previously two independent booleans whose combination had no
+    name and no validated transitions.  The closed vocabulary makes the
+    hold interaction explicit.
+    """
+
+    NORMAL = "normal"
+    NETWORK_HOLD = "network_hold"
+    OPERATOR_HOLD = "operator_hold"
+    DUAL_HOLD = "dual_hold"
+
+
 # Legal state transitions.  Each key maps to the set of states it may move to.
 # The engine validates every transition against this table.
 LEGAL_TRANSITIONS: dict[ProjectState, set[ProjectState]] = {
@@ -44,6 +70,17 @@ LEGAL_TRANSITIONS: dict[ProjectState, set[ProjectState]] = {
     ProjectState.REPAIR_REQUIRED: {ProjectState.RECOVERING, ProjectState.READY, ProjectState.PAUSED},
     ProjectState.PAUSED: {ProjectState.READY, ProjectState.STOPPED},
     ProjectState.RECOVERING: {ProjectState.READY, ProjectState.STOPPED, ProjectState.REPAIR_REQUIRED},
+}
+
+
+# Legal run-mode transitions.  Each move flips exactly one hold axis, so
+# DUAL_HOLD is entered and left one hold at a time and diagonal jumps
+# (NORMAL <-> DUAL_HOLD) are impossible.
+LEGAL_RUN_MODE_TRANSITIONS: dict[RunMode, set[RunMode]] = {
+    RunMode.NORMAL: {RunMode.NETWORK_HOLD, RunMode.OPERATOR_HOLD},
+    RunMode.NETWORK_HOLD: {RunMode.NORMAL, RunMode.DUAL_HOLD},
+    RunMode.OPERATOR_HOLD: {RunMode.NORMAL, RunMode.DUAL_HOLD},
+    RunMode.DUAL_HOLD: {RunMode.NETWORK_HOLD, RunMode.OPERATOR_HOLD},
 }
 
 
@@ -61,6 +98,7 @@ class Project:
     priority: int
     weight: int
     state: ProjectState = ProjectState.READY
+    paused_by: set[PauseCause] = field(default_factory=set)
     attempts: int = 0
     max_attempts: int = 3
     cooldown_seconds: float = 30.0
@@ -72,6 +110,11 @@ class Project:
             raise ValueError(f"priority must be positive, got {self.priority}")
         if self.weight <= 0:
             raise ValueError(f"weight must be positive, got {self.weight}")
+        self.paused_by = {PauseCause(cause) for cause in self.paused_by}
+        if self.state is ProjectState.PAUSED and not self.paused_by:
+            raise ValueError("PAUSED requires at least one recorded pause cause")
+        if self.state is not ProjectState.PAUSED and self.paused_by:
+            raise ValueError("pause causes recorded for a non-PAUSED project")
 
 
 @dataclass(frozen=True)
