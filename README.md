@@ -84,7 +84,7 @@ stateDiagram-v2
     REPAIR_REQUIRED --> READY : operator acknowledgment
     RECOVERING --> READY : process absent, cleared
     RECOVERING --> RUNNING : process re-adopted
-    PAUSED --> READY : network restored
+    PAUSED --> READY : last hold cleared (network restored or operator resume)
     PAUSED --> STOPPED : operator stop
 ```
 

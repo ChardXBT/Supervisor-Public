@@ -8,7 +8,13 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT / "src"))
 
-from supervisor_public import ProjectState, demo_engine  # noqa: E402
+from supervisor_public import (  # noqa: E402
+    PauseCause,
+    Project,
+    ProjectState,
+    RunMode,
+    demo_engine,
+)
 
 
 class SupervisorEngineTests(unittest.TestCase):
@@ -96,6 +102,116 @@ class SupervisorEngineTests(unittest.TestCase):
                 ProjectState.STARTING,
                 "illegal jump from RUNNING back to STARTING",
             )
+
+
+class RunModeTests(unittest.TestCase):
+    """The supervisor run mode (network_ready x automation_paused) is one
+    declared state with validated transitions, not two loose booleans."""
+
+    def test_operator_pause_blocks_scheduling(self) -> None:
+        engine = demo_engine()
+        engine.pause_automation()
+        self.assertEqual(engine.run_mode, RunMode.OPERATOR_HOLD)
+        self.assertTrue(engine.automation_paused)
+        self.assertIsNone(engine.schedule())
+
+    def test_operator_pause_parks_running_projects(self) -> None:
+        engine = demo_engine()
+        project = engine.schedule()
+        engine.pause_automation()
+        self.assertEqual(project.state, ProjectState.PAUSED)
+        self.assertEqual(project.paused_by, {PauseCause.OPERATOR})
+
+    def test_resume_automation_releases_projects(self) -> None:
+        engine = demo_engine()
+        project = engine.schedule()
+        engine.pause_automation()
+        engine.resume_automation()
+        self.assertEqual(engine.run_mode, RunMode.NORMAL)
+        self.assertEqual(project.state, ProjectState.READY)
+        self.assertIsNotNone(engine.schedule())
+
+    def test_recover_network_honors_operator_hold(self) -> None:
+        # Regression: a network flap-and-recovery must not release a
+        # project the operator parked.
+        engine = demo_engine()
+        project = engine.schedule()
+        engine.pause_automation()
+        engine.disconnect()
+        self.assertEqual(engine.run_mode, RunMode.DUAL_HOLD)
+        engine.recover_network()
+        self.assertEqual(engine.run_mode, RunMode.OPERATOR_HOLD)
+        self.assertTrue(engine.automation_paused)
+        self.assertEqual(project.state, ProjectState.PAUSED)
+        self.assertIsNone(engine.schedule())
+
+    def test_operator_hold_stacks_over_network_pause(self) -> None:
+        engine = demo_engine()
+        project = engine.schedule()
+        engine.disconnect()
+        engine.pause_automation()
+        self.assertEqual(engine.run_mode, RunMode.DUAL_HOLD)
+        self.assertEqual(project.paused_by, {PauseCause.NETWORK, PauseCause.OPERATOR})
+        engine.recover_network()
+        self.assertEqual(project.state, ProjectState.PAUSED)
+        self.assertIsNone(engine.schedule())
+        engine.resume_automation()
+        self.assertEqual(project.state, ProjectState.READY)
+        self.assertIsNotNone(engine.schedule())
+
+    def test_network_hold_stacks_over_operator_pause(self) -> None:
+        engine = demo_engine()
+        project = engine.schedule()
+        engine.pause_automation()
+        engine.disconnect()
+        self.assertEqual(project.paused_by, {PauseCause.OPERATOR, PauseCause.NETWORK})
+        engine.resume_automation()
+        self.assertEqual(engine.run_mode, RunMode.NETWORK_HOLD)
+        self.assertEqual(project.state, ProjectState.PAUSED)
+        engine.recover_network()
+        self.assertEqual(project.state, ProjectState.READY)
+
+    def test_run_mode_rejects_illegal_transitions(self) -> None:
+        engine = demo_engine()
+        with self.assertRaises(ValueError):
+            engine.recover_network()
+        with self.assertRaises(ValueError):
+            engine.resume_automation()
+        engine.disconnect()
+        with self.assertRaises(ValueError):
+            engine.disconnect()
+        with self.assertRaises(ValueError):
+            engine.resume_automation()
+        engine.recover_network()
+        engine.pause_automation()
+        with self.assertRaises(ValueError):
+            engine.pause_automation()
+
+    def test_run_mode_flags_are_derived_and_read_only(self) -> None:
+        engine = demo_engine()
+        self.assertTrue(engine.network_ready)
+        self.assertFalse(engine.automation_paused)
+        with self.assertRaises(AttributeError):
+            engine.automation_paused = True
+        with self.assertRaises(AttributeError):
+            engine.network_ready = False
+        engine.disconnect()
+        self.assertFalse(engine.network_ready)
+        self.assertFalse(engine.automation_paused)
+
+    def test_unknown_run_mode_fails_loudly(self) -> None:
+        engine = demo_engine()
+        engine.run_mode = "bogus"
+        with self.assertRaises(ValueError):
+            engine.schedule()
+
+    def test_paused_requires_recorded_cause(self) -> None:
+        engine = demo_engine()
+        project = engine.schedule()
+        with self.assertRaises(ValueError):
+            engine._transition(project, ProjectState.PAUSED, "no cause recorded")
+        with self.assertRaises(ValueError):
+            Project("p", priority=1, weight=1, state=ProjectState.PAUSED)
 
 
 if __name__ == "__main__":
